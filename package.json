@@ -1,0 +1,38 @@
+{
+  "name": "cooler-tuya-api",
+  "version": "1.0.0",
+  "description": "Thermostatic Tuya smart-plug fan controller driven by CPU and HDD temperatures.",
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "yarn@4.17.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "fastify": "^5.1.0",
+    "pino": "^9.5.0",
+    "tuyapi": "^7.4.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.14.0",
+    "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^2.1.4",
+    "eslint": "^9.14.0",
+    "prettier": "^3.3.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.13.0",
+    "vitest": "^2.1.4"
+  }
+}

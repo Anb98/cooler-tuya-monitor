@@ -1,0 +1,27 @@
+services:
+  cooler-tuya-api:
+    build: .
+    image: cooler-tuya-api:latest
+    container_name: cooler-tuya-api
+    restart: unless-stopped
+    # Tuya local-LAN discovery/control relies on UDP broadcast on the same
+    # network segment as the plug; host networking is the simplest way to
+    # guarantee that on typical home/NAS deployments.
+    network_mode: host
+    # SYS_RAWIO is required for smartctl to issue raw ATA/SCSI SMART
+    # commands against the listed block devices below.
+    cap_add:
+      - SYS_RAWIO
+    # Least-privilege device access: list only the disks you want monitored
+    # instead of granting --privileged. Adjust this list (and HDD_DEVICES in
+    # .env) to match your host's actual disks.
+    devices:
+      - "/dev/sda"
+      - "/dev/sdb"
+      - "/dev/sdc"
+      - "/dev/sdd"
+      - "/dev/sde"
+    volumes:
+      - "/sys:/sys:ro"
+    env_file:
+      - .env
