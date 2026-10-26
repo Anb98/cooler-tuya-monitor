@@ -71,7 +71,7 @@ export class ControlLoop {
 
   start(pollIntervalMs: number): void {
     if (this.timer) return;
-    this.timer = setInterval(() => {
+    const run = () => {
       // Re-entrancy guard: skip this tick if the previous runOnce() has not
       // resolved yet, so overlapping ticks never race SharedControlState.
       if (this.running) {
@@ -82,7 +82,9 @@ export class ControlLoop {
       void this.runOnce().finally(() => {
         this.running = false;
       });
-    }, pollIntervalMs);
+    };
+    this.timer = setInterval(run, pollIntervalMs);
+    run(); // Establish safe hardware state without waiting one polling interval.
   }
 
   stop(): void {
@@ -95,6 +97,7 @@ export class ControlLoop {
   async runOnce(): Promise<Decision> {
     try {
       const aggregate = await readAllSensors(this.sensors);
+      await this.refreshPlugState();
 
       const { memory, decision } = tick(
         this.state.memory,
@@ -128,8 +131,24 @@ export class ControlLoop {
       // (sensorOk:false) and drive the fan ON.
       const message = err instanceof Error ? err.message : String(err);
       this.logger?.error({ err: message }, 'control loop: unexpected error during tick — forcing fail-safe ON');
+      await this.refreshPlugState();
       return this.forceFailSafeOn();
     }
+  }
+
+  private async refreshPlugState(): Promise<void> {
+    try {
+      const actual = await this.plug.getState();
+      this.state.appliedFanOn = actual === 'unknown' ? null : actual === 'on';
+      if (actual !== 'unknown') return;
+    } catch (err) {
+      this.state.appliedFanOn = null;
+      this.logger?.warn({ err: String(err) }, 'control loop: plug state read failed');
+    }
+    this.state.plugCommsOk = false;
+    this.logger?.warn('control loop: plug state unknown — forcing fail-safe ON');
+    // A successful read does not clear an earlier failed command: reassert
+    // the safe ON state once before allowing normal auto/manual control.
   }
 
   /** Drive the fan to the fail-safe (ON) state after an unexpected tick error. */
@@ -169,7 +188,7 @@ export class ControlLoop {
     // been CONFIRMED applied — this is what makes retries happen on
     // subsequent cycles when a previous attempt failed (design: "system
     // must retry and keep attempting to reach the safe (ON) state").
-    const needsCommand = this.state.appliedFanOn !== decision.fanOn;
+    const needsCommand = !this.state.plugCommsOk || this.state.appliedFanOn !== decision.fanOn;
 
     if (!needsCommand) {
       this.logger?.debug(logPayload, 'control loop: hold');
@@ -188,6 +207,8 @@ export class ControlLoop {
       this.state.appliedFanOn = decision.fanOn;
     } catch (err) {
       this.state.plugCommsOk = false;
+      // A lost acknowledgement can mean the relay changed despite failure.
+      this.state.appliedFanOn = null;
       const message = err instanceof Error ? err.message : String(err);
       this.logger?.error(
         { err: message, action: decision.action },

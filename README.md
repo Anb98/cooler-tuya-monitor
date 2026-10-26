@@ -205,7 +205,7 @@ malformed, rather than running with undefined behavior.
 | `TUYA_IP` | *(required)* | Local LAN IP address of the smart plug. |
 | `TUYA_VERSION` | `3.3` | Tuya local protocol version reported by `tuya-cli`. |
 | `DRY_RUN` | `false` | When `true`, no real Tuya commands are sent — decisions are only logged. |
-| `FAIL_SAFE` | `true` | Whether sensor/comms failures force the fan ON (recommended: keep `true`). |
+| `FAIL_SAFE` | `true` | Legacy compatibility setting. Parsed but does not disable protection: sensor/comms failures always force the fan ON. |
 | `HTTP_ENABLED` | `true` | Enable the Fastify HTTP API (`/health`, `/status`, `/fan/*`). |
 | `PORT` | `3000` | HTTP listen port. |
 | `HTTP_HOST` | `0.0.0.0` | HTTP bind address. The API is **unauthenticated** — set to `127.0.0.1` to restrict it to localhost (see [Security note](#security-note)). |
@@ -295,10 +295,17 @@ default recommendation.
 | Endpoint | Method | Description |
 |---|---|---|
 | `/health` | GET | Liveness check, returns `200 OK`. |
-| `/status` | GET | Current temps, fan state, mode (`auto`/`manual`), and last decision. |
+| `/status` | GET | Current temps, desired and confirmed relay state, communication health, mode (`auto`/`manual`), and last decision. |
 | `/fan/on` | POST | Force the fan ON (sticky manual override). |
 | `/fan/off` | POST | Force the fan OFF (sticky manual override; critical temps still override this). |
 | `/fan/auto` | POST | Clear the manual override and return to automatic hysteresis control. |
+
+`/status.fanOn` retains its original meaning: the **desired** fan state.
+`confirmedFanOn` is the latest relay state read or acknowledged command (`null`
+when unknown), and `plugCommsOk` reports communication health. These are not a
+physical fan-speed sensor: an energized relay cannot prove that the fan spins.
+In `DRY_RUN` mode, confirmed state is simulated, not a hardware observation.
+`/health` is liveness only; it does not guarantee successful cooling.
 
 ### Security note
 
@@ -315,9 +322,20 @@ that adds authentication.
 - Manual overrides are **never** allowed to disable thermal protection:
   reaching `CPU_TEMP_CRITICAL` or `HDD_TEMP_CRITICAL` re-enables the fan
   even if you've called `/fan/off`.
+- The first control cycle runs immediately at startup. Subsequent cycles
+  follow `POLL_INTERVAL_SEC`; an in-flight cycle is never overlapped.
+- Each cycle reads the relay state, detecting external OFF changes (for
+  example after a plug power loss). Failed commands invalidate the cached
+  state: recovery explicitly reasserts **ON** before normal control resumes.
 - Sensor read failures and Tuya communication failures are treated as a
   fail-safe condition — the system errs toward keeping the fan **ON** and
-  retries the plug command on subsequent cycles.
+  retries the plug command on subsequent cycles. Protection is mandatory;
+  the legacy `FAIL_SAFE=false` value does not disable it.
+- Tuya attempts have a 10-second deadline, including connection/handshake
+  and response, with up to three attempts and 0.5/2-second retry delays.
+  Read and write phases can each take up to about 32.5 seconds during an
+  outage, in addition to sensor time. Overlapping polling ticks are skipped.
+  No software fail-safe can energize an unreachable or unpowered plug.
 - On shutdown (`SIGTERM`), the control loop stops polling but **does not**
   turn the fan off — this avoids losing cooling if the container is
   restarting or being redeployed.

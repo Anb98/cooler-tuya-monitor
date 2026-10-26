@@ -65,8 +65,8 @@ describe('bootstrap wiring', () => {
       startHttpListener: false,
     });
 
-    // Fan turns ON due to hot CPU reading.
-    await loop.runOnce();
+    // Bootstrap now starts the first cycle immediately; do not launch a concurrent tick.
+    await vi.waitFor(() => expect(loop.state.appliedFanOn).toBe(true));
     expect(plug.turnOnCalls).toBe(1);
 
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);

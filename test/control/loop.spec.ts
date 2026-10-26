@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ControlLoop } from '../../src/control/loop.js';
 import { FakeClock } from '../fakes/fake-clock.js';
 import { FakePlug } from '../fakes/fake-plug.js';
@@ -27,6 +27,155 @@ function fakeFailingSensor(error: string): TemperatureSensor {
 function fakeRejectingSensor(error: string): TemperatureSensor {
   return { read: async () => Promise.reject(new Error(error)) };
 }
+
+describe('ControlLoop — recovery and reconciliation', () => {
+  it('reasserts ON after an OFF applied by the plug but not acknowledged, then resumes auto', async () => {
+    const clock = new FakeClock(0);
+    const plug = new FakePlug();
+    let cpu = 65;
+    const sensors = [{ read: async (): Promise<SensorResult> => ({ ok: true, readings: [{ id: 'cpu', kind: 'cpu', label: 'CPU', celsius: cpu }] }) }];
+    const loop = new ControlLoop({ sensors, plug, clock, thresholds });
+    await loop.runOnce();
+    cpu = 35;
+    clock.advance(120000);
+    await loop.runOnce();
+    clock.advance(300000);
+    const turnOff = vi.spyOn(plug, 'turnOff').mockImplementationOnce(async () => {
+      plug.state = 'off';
+      throw new Error('OFF applied, acknowledgement lost');
+    });
+    await loop.runOnce();
+    expect(loop.state.appliedFanOn).toBeNull();
+    expect(loop.state.plugCommsOk).toBe(false);
+    const recovery = await loop.runOnce();
+    expect(recovery.reason).toMatch(/communication failure/);
+    expect(plug.turnOnCalls).toBe(2);
+    expect(plug.state).toBe('on');
+    expect(loop.state.plugCommsOk).toBe(true);
+    await loop.runOnce();
+    clock.advance(300000);
+    await loop.runOnce();
+    expect(turnOff).toHaveBeenCalledTimes(2);
+    expect(plug.state).toBe('off');
+  });
+
+  it('detects external OFF while hot without redundant writes when state agrees', async () => {
+    const plug = new FakePlug();
+    const loop = new ControlLoop({ sensors: [fakeSensor({ ok: true, readings: [{ id: 'cpu', kind: 'cpu', label: 'CPU', celsius: 65 }] })], plug, clock: new FakeClock(0), thresholds });
+    await loop.runOnce();
+    await loop.runOnce();
+    expect(plug.turnOnCalls).toBe(1);
+    plug.state = 'off';
+    await loop.runOnce();
+    expect(plug.getStateCalls).toBe(3);
+    expect(plug.turnOnCalls).toBe(2);
+    expect(plug.state).toBe('on');
+  });
+
+  it.each(['unknown', 'reject'])('forces safe ON on %s readback even when cool and manual OFF', async (failure) => {
+    const plug = new FakePlug();
+    vi.spyOn(plug, 'getState').mockImplementation(async () => {
+      if (failure === 'reject') throw new Error('read failed');
+      return 'unknown';
+    });
+    const loop = new ControlLoop({ sensors: [fakeSensor({ ok: true, readings: [] })], plug, clock: new FakeClock(0), thresholds });
+    loop.setOverride('off');
+    const decision = await loop.runOnce();
+    expect(decision.fanOn).toBe(true);
+    expect(decision.reason).toMatch(/communication failure/);
+    expect(plug.turnOnCalls).toBe(1);
+    expect(plug.turnOffCalls).toBe(0);
+    expect(loop.state.appliedFanOn).toBe(true);
+  });
+
+  it('starts immediately once, skips overlapping scheduled ticks, and stops polling', async () => {
+    vi.useFakeTimers();
+    const plug = new FakePlug();
+    let resolve!: (value: SensorResult) => void;
+    const read = vi.fn(() => new Promise<SensorResult>((done) => { resolve = done; }));
+    const loop = new ControlLoop({ sensors: [{ read }], plug, clock: new FakeClock(0), thresholds });
+    try {
+      loop.start(60000);
+      loop.start(60000);
+      expect(read).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(120000);
+      expect(read).toHaveBeenCalledTimes(1);
+      resolve({ ok: false, error: 'sensor unavailable' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(plug.turnOnCalls).toBe(1);
+      loop.stop();
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      loop.stop();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('ControlLoop — verifier regressions', () => {
+  const cpuSensor = (celsius: () => number): TemperatureSensor => ({
+    read: async () => ({ ok: true, readings: [{ id: 'cpu', kind: 'cpu', label: 'CPU', celsius: celsius() }] }),
+  });
+
+  it('recovers at 65C after a manual OFF applied without acknowledgement', async () => {
+    let cpu = 35;
+    const plug = new FakePlug();
+    const loop = new ControlLoop({ sensors: [cpuSensor(() => cpu)], plug, clock: new FakeClock(0), thresholds });
+    loop.setOverride('on');
+    await loop.runOnce();
+    loop.setOverride('off');
+    vi.spyOn(plug, 'turnOff').mockImplementationOnce(async () => {
+      plug.state = 'off';
+      throw new Error('ack lost');
+    });
+    await loop.runOnce();
+    loop.setOverride(null);
+    cpu = 65;
+    for (let i = 0; i < 3; i++) await loop.runOnce();
+    expect(plug.state).toBe('on');
+    expect(plug.turnOnCalls).toBe(2);
+    expect(loop.state.plugCommsOk).toBe(true);
+  });
+
+  it('avoids writes from startup when the relay already matches hot or cool demand', async () => {
+    const on = new FakePlug();
+    on.state = 'on';
+    const hot = new ControlLoop({ sensors: [cpuSensor(() => 65)], plug: on, clock: new FakeClock(0), thresholds });
+    const off = new FakePlug();
+    const cool = new ControlLoop({ sensors: [cpuSensor(() => 35)], plug: off, clock: new FakeClock(0), thresholds });
+    for (let i = 0; i < 5; i++) {
+      await hot.runOnce();
+      await cool.runOnce();
+    }
+    expect(on.turnOnCalls + on.turnOffCalls + off.turnOnCalls + off.turnOffCalls).toBe(0);
+    expect(on.getStateCalls).toBe(5);
+    expect(off.getStateCalls).toBe(5);
+  });
+
+  it('skips scheduled ticks during pending readback and resumes after completion', async () => {
+    vi.useFakeTimers();
+    const plug = new FakePlug();
+    let release!: (state: 'on' | 'off') => void;
+    const get = vi.spyOn(plug, 'getState').mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const loop = new ControlLoop({ sensors: [cpuSensor(() => 65)], plug, clock: new FakeClock(0), thresholds });
+    try {
+      loop.start(1000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(plug.turnOnCalls).toBe(0);
+      release('off');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(plug.turnOnCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(plug.turnOnCalls).toBe(1);
+    } finally {
+      loop.stop();
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('ControlLoop — integration with fakes', () => {
   it('issues turnOn plug call for a HIGH -> ON scenario', async () => {

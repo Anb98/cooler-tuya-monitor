@@ -26,7 +26,9 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
   app.get('/status', async () => {
     const decision = controlState.lastDecision;
     return {
-      fanOn: decision?.fanOn ?? null,
+      fanOn: decision?.fanOn ?? null, // Legacy desired state; not physical confirmation.
+      confirmedFanOn: controlState.appliedFanOn,
+      plugCommsOk: controlState.plugCommsOk,
       state: controlState.memory.state,
       mode: controlState.override === null ? 'auto' : 'manual',
       override: controlState.override,

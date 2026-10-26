@@ -1,13 +1,17 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 const connectMock = vi.hoisted(() => vi.fn());
 const setMock = vi.hoisted(() => vi.fn());
 const disconnectMock = vi.hoisted(() => vi.fn());
+const getMock = vi.hoisted(() => vi.fn());
+const destroyMock = vi.hoisted(() => vi.fn());
 const TuyaDeviceMock = vi.hoisted(() =>
   vi.fn().mockImplementation(() => ({
     connect: connectMock,
     set: setMock,
     disconnect: disconnectMock,
+    get: getMock,
+    client: { destroy: destroyMock },
     // Real tuyapi TuyaDevice is an EventEmitter; the plug attaches an 'error'
     // listener in createDevice(), so the fake must expose .on too.
     on: vi.fn(),
@@ -28,6 +32,54 @@ describe('TuyapiLocalPlug', () => {
     setMock.mockReset();
     disconnectMock.mockReset();
     TuyaDeviceMock.mockClear();
+    getMock.mockReset();
+    destroyMock.mockClear();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it.each(['connect', 'get', 'set'])('bounds a hung %s and cleans up every retry', async (stage) => {
+    vi.useFakeTimers();
+    connectMock.mockResolvedValue(true);
+    getMock.mockResolvedValue(true);
+    setMock.mockResolvedValue({});
+    const hung = () => new Promise<never>(() => {});
+    ({ connect: connectMock, get: getMock, set: setMock })[stage]!.mockImplementation(hung);
+    const plug = new TuyapiLocalPlug({ ...baseOptions, attemptTimeoutMs: 100, backoffMs: [0] });
+    const operation = stage === 'get'
+      ? expect(plug.getState()).resolves.toBe('unknown')
+      : expect(plug.turnOn()).rejects.toThrow('Tuya command failed after 3 attempts: Tuya attempt timed out after 100ms');
+    await vi.runAllTimersAsync();
+    await operation;
+    expect(connectMock).toHaveBeenCalledTimes(3);
+    expect(disconnectMock).toHaveBeenCalledTimes(3);
+    expect(destroyMock).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('never sends a late OFF after an expired connection resolves', async () => {
+    vi.useFakeTimers();
+    let connected!: (value: boolean) => void;
+    connectMock.mockImplementation(() => new Promise<boolean>((resolve) => { connected = resolve; }));
+    const plug = new TuyapiLocalPlug({ ...baseOptions, attemptTimeoutMs: 100, maxRetries: 1 });
+    const failure = expect(plug.turnOff()).rejects.toThrow(/timed out/);
+    await vi.advanceTimersByTimeAsync(100);
+    await failure;
+    connected(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(setMock).not.toHaveBeenCalled();
+    expect(destroyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([[true, 'on'], [false, 'off'], ['invalid', 'unknown']])('maps readback %s to %s without background reads', async (value, state) => {
+    connectMock.mockResolvedValue(true);
+    getMock.mockResolvedValue(value);
+    const plug = new TuyapiLocalPlug(baseOptions);
+    await expect(plug.getState()).resolves.toBe(state);
+    expect(getMock).toHaveBeenCalledWith({ dps: 1 });
+    expect(TuyaDeviceMock).toHaveBeenCalledWith(expect.objectContaining({ issueGetOnConnect: false }));
+    expect(setMock).not.toHaveBeenCalled();
+    expect(disconnectMock).toHaveBeenCalledTimes(1);
   });
 
   it('resolves without retrying when the command succeeds on first attempt', async () => {

@@ -51,8 +51,24 @@ describe('HTTP server', () => {
     expect(response.statusCode).toBe(200);
     expect(body.temps.cpu).toBe(65);
     expect(body.fanOn).toBe(true);
+    expect(body.confirmedFanOn).toBe(true);
+    expect(body.plugCommsOk).toBe(true);
     expect(body.mode).toBe('auto');
     expect(body.lastDecision.action).toBe('turnOn');
+  });
+
+  it('distinguishes desired from unconfirmed state after failed commands', async () => {
+    const plug = new FakePlug({ alwaysFail: true });
+    const loop = new ControlLoop({ sensors: [fakeSensor({ ok: true, readings: [{ id: 'cpu', kind: 'cpu', label: 'CPU', celsius: 65 }] })], plug, clock: new FakeClock(0), thresholds });
+    const app = buildServer({ controlState: loop.state });
+    const initial = await app.inject({ method: 'GET', url: '/status' });
+    expect(initial.json()).toMatchObject({ fanOn: null, confirmedFanOn: null });
+    await loop.runOnce();
+    const response = await app.inject({ method: 'GET', url: '/status' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ fanOn: true, confirmedFanOn: null, plugCommsOk: false });
+    expect(response.json().lastDecision.action).toBe('turnOn');
+    await app.close();
   });
 
   it('POST /fan/on then next loop tick keeps fan ON regardless of temps', async () => {
@@ -65,6 +81,23 @@ describe('HTTP server', () => {
 
     const decision = await loop.runOnce();
     expect(decision.fanOn).toBe(true);
+  });
+
+  it('preserves manual OFF and lets critical temperature override it', async () => {
+    const { loop } = buildLoop(20);
+    const app = buildServer({ controlState: loop.state });
+    await app.inject({ method: 'POST', url: '/fan/on' });
+    await loop.runOnce();
+    const response = await app.inject({ method: 'POST', url: '/fan/off' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ override: 'off' });
+    expect((await loop.runOnce()).fanOn).toBe(false);
+    const hot = new ControlLoop({ sensors: [fakeSensor({ ok: true, readings: [{ id: 'cpu', kind: 'cpu', label: 'CPU', celsius: 80 }] })], plug: new FakePlug(), clock: new FakeClock(0), thresholds });
+    const hotApp = buildServer({ controlState: hot.state });
+    await hotApp.inject({ method: 'POST', url: '/fan/off' });
+    expect((await hot.runOnce()).fanOn).toBe(true);
+    await app.close();
+    await hotApp.close();
   });
 
   it('POST /fan/auto clears override, next tick returns to automatic hysteresis', async () => {

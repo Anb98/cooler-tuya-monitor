@@ -11,6 +11,8 @@ export interface TuyapiLocalPlugOptions {
   dps?: number;
   /** Max retry attempts on transient failure. */
   maxRetries?: number;
+  /** Deadline covering connect, handshake and the command/read response per attempt. */
+  attemptTimeoutMs?: number;
   /** Backoff delays (ms) between retries; last value repeats if retries > delays.length. */
   backoffMs?: number[];
   /** Injectable sleep for deterministic tests. */
@@ -37,6 +39,7 @@ export class TuyapiLocalPlug implements PlugController {
   private readonly dps: number;
   private readonly maxRetries: number;
   private readonly backoffMs: number[];
+  private readonly attemptTimeoutMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly logger?: Logger;
   private readonly deviceOptions: { id: string; key: string; ip: string; version: string };
@@ -50,6 +53,7 @@ export class TuyapiLocalPlug implements PlugController {
     };
     this.dps = options.dps ?? 1;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+    this.attemptTimeoutMs = options.attemptTimeoutMs ?? 10000;
     this.backoffMs = options.backoffMs ?? DEFAULT_BACKOFF_MS;
     this.sleep = options.sleep ?? defaultSleep;
     this.logger = options.logger;
@@ -76,28 +80,44 @@ export class TuyapiLocalPlug implements PlugController {
   }
 
   private async setDps(value: boolean): Promise<void> {
-    const device = this.createDevice();
-    try {
-      await device.connect();
-      await device.set({ dps: this.dps, set: value });
-    } finally {
-      device.disconnect();
-    }
+    await this.withDevice((device) => device.set({ dps: this.dps, set: value }));
   }
 
   private async getDps(): Promise<unknown> {
+    return this.withDevice((device) => device.get({ dps: this.dps }));
+  }
+
+  private async withDevice<T>(operation: (device: TuyaDevice) => Promise<T>): Promise<T> {
     const device = this.createDevice();
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutError = new Error(`Tuya attempt timed out after ${this.attemptTimeoutMs}ms`);
     try {
-      await device.connect();
-      const result = (await device.get({ dps: this.dps })) as unknown;
-      return result;
+      return await Promise.race([
+        (async () => {
+          await device.connect();
+          // A late handshake must never dispatch an obsolete command after a retry.
+          if (expired) throw timeoutError;
+          return operation(device);
+        })(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            expired = true;
+            reject(timeoutError);
+          }, this.attemptTimeoutMs);
+        }),
+      ]);
     } finally {
+      clearTimeout(timer);
       device.disconnect();
+      // tuyapi.disconnect() is a no-op before a completed handshake. Destroy
+      // its socket too, so a timed-out 3.4 handshake cannot outlive this attempt.
+      (device as TuyaDevice & { client?: { destroy(): void } }).client?.destroy();
     }
   }
 
   private createDevice(): TuyaDevice {
-    const device = new TuyaDevice(this.deviceOptions);
+    const device = new TuyaDevice({ ...this.deviceOptions, issueGetOnConnect: false });
     // Attach an 'error' listener IMMEDIATELY. tuyapi emits 'error' from raw
     // socket callbacks (connect-timeout / socket-error / parse-error); with no
     // listener Node throws synchronously and crashes the whole daemon instead
