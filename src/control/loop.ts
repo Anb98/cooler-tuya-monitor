@@ -4,6 +4,7 @@ import { readAllSensors } from '../sensors/aggregate.js';
 import type { PlugController } from '../tuya/types.js';
 import type { Clock } from './clock.js';
 import { tick } from './state-machine.js';
+import { logCycleEvent, type CommandOutcome, type CycleSample, type RelayReadback } from './telemetry.js';
 import type { ControlMemory, Decision, Override, ThresholdConfig } from './types.js';
 import { INITIAL_MEMORY } from './types.js';
 
@@ -30,7 +31,8 @@ export interface SharedControlState {
 /**
  * Tick-driven control loop: reads all sensors, feeds the pure state
  * machine, and drives the plug controller based on the decision. Logs every
- * decision (temps, action, reason). Retries plug commands are handled by
+ * decision (temps, action, reason) and one `cooler.cycle` telemetry event per
+ * completed cycle (see telemetry.ts). Retries plug commands are handled by
  * the PlugController implementation itself (e.g. TuyapiLocalPlug); here we
  * simply track whether the last attempted command succeeded to feed
  * `plugCommsOk` into the next tick's fail-safe evaluation.
@@ -97,7 +99,14 @@ export class ControlLoop {
   async runOnce(): Promise<Decision> {
     try {
       const aggregate = await readAllSensors(this.sensors);
-      await this.refreshPlugState();
+      const sample: CycleSample = {
+        sampledAt: this.clock.now(),
+        maxCpu: aggregate.maxCpu,
+        maxHdd: aggregate.maxHdd,
+        sensorOk: aggregate.ok,
+      };
+      const readback = await this.refreshPlugState();
+      const override = this.state.override;
 
       const { memory, decision } = tick(
         this.state.memory,
@@ -106,7 +115,7 @@ export class ControlLoop {
           maxHdd: aggregate.maxHdd,
           sensorOk: aggregate.ok,
           plugCommsOk: this.state.plugCommsOk,
-          override: this.state.override,
+          override,
           now: this.clock.now(),
         },
         this.thresholds,
@@ -121,7 +130,8 @@ export class ControlLoop {
         this.logger?.warn({ errors: aggregate.errors }, 'sensor read failure this tick — fail-safe input');
       }
 
-      await this.applyDecision(decision, aggregate.maxCpu, aggregate.maxHdd);
+      const commandOutcome = await this.applyDecision(decision, aggregate.maxCpu, aggregate.maxHdd);
+      this.logCycle(sample, readback, override, decision, commandOutcome);
 
       return decision;
     } catch (err) {
@@ -131,28 +141,32 @@ export class ControlLoop {
       // (sensorOk:false) and drive the fan ON.
       const message = err instanceof Error ? err.message : String(err);
       this.logger?.error({ err: message }, 'control loop: unexpected error during tick — forcing fail-safe ON');
-      await this.refreshPlugState();
-      return this.forceFailSafeOn();
+      const readback = await this.refreshPlugState();
+      return this.forceFailSafeOn(readback);
     }
   }
 
-  private async refreshPlugState(): Promise<void> {
+  /** Reads the relay before any command; the result is never a command acknowledgement. */
+  private async refreshPlugState(): Promise<RelayReadback> {
     try {
       const actual = await this.plug.getState();
       this.state.appliedFanOn = actual === 'unknown' ? null : actual === 'on';
-      if (actual !== 'unknown') return;
     } catch (err) {
       this.state.appliedFanOn = null;
       this.logger?.warn({ err: String(err) }, 'control loop: plug state read failed');
     }
+    const readback: RelayReadback = { readbackAt: this.clock.now(), relayObservedFanOn: this.state.appliedFanOn };
+    if (readback.relayObservedFanOn !== null) return readback;
     this.state.plugCommsOk = false;
     this.logger?.warn('control loop: plug state unknown — forcing fail-safe ON');
     // A successful read does not clear an earlier failed command: reassert
     // the safe ON state once before allowing normal auto/manual control.
+    return readback;
   }
 
   /** Drive the fan to the fail-safe (ON) state after an unexpected tick error. */
-  private async forceFailSafeOn(): Promise<Decision> {
+  private async forceFailSafeOn(readback: RelayReadback): Promise<Decision> {
+    const override = this.state.override;
     const { memory, decision } = tick(
       this.state.memory,
       {
@@ -160,7 +174,7 @@ export class ControlLoop {
         maxHdd: null,
         sensorOk: false,
         plugCommsOk: this.state.plugCommsOk,
-        override: this.state.override,
+        override,
         now: this.clock.now(),
       },
       this.thresholds,
@@ -169,12 +183,42 @@ export class ControlLoop {
     this.state.memory = memory;
     this.state.lastDecision = decision;
 
-    await this.applyDecision(decision, this.state.lastMaxCpu, this.state.lastMaxHdd);
+    const commandOutcome = await this.applyDecision(decision, this.state.lastMaxCpu, this.state.lastMaxHdd);
+    // Telemetry reports the fail-safe inputs, not the stale legacy temperatures.
+    const sample: CycleSample = { sampledAt: null, maxCpu: null, maxHdd: null, sensorOk: false };
+    this.logCycle(sample, readback, override, decision, commandOutcome);
 
     return decision;
   }
 
-  private async applyDecision(decision: Decision, maxCpu: number | null, maxHdd: number | null): Promise<void> {
+  private logCycle(
+    sample: CycleSample,
+    readback: RelayReadback,
+    override: Override,
+    decision: Decision,
+    commandOutcome: CommandOutcome,
+  ): void {
+    const { cpuHigh, hddHigh, cpuCritical, hddCritical } = this.thresholds;
+    logCycleEvent(this.logger, () => ({
+      event: 'cooler.cycle',
+      schema: 1,
+      ...sample,
+      ...readback,
+      completedAt: this.clock.now(),
+      thresholds: { cpuHigh, hddHigh, cpuCritical, hddCritical },
+      override,
+      desiredFanOn: decision.fanOn,
+      commandOutcome,
+      plugCommsOk: this.state.plugCommsOk,
+      dryRun: this.dryRun,
+    }));
+  }
+
+  private async applyDecision(
+    decision: Decision,
+    maxCpu: number | null,
+    maxHdd: number | null,
+  ): Promise<CommandOutcome> {
     const logPayload = {
       maxCpu,
       maxHdd,
@@ -192,7 +236,7 @@ export class ControlLoop {
 
     if (!needsCommand) {
       this.logger?.debug(logPayload, 'control loop: hold');
-      return;
+      return 'not_needed';
     }
 
     this.logger?.info(logPayload, 'control loop: decision');
@@ -205,6 +249,7 @@ export class ControlLoop {
       }
       this.state.plugCommsOk = true;
       this.state.appliedFanOn = decision.fanOn;
+      return 'acknowledged';
     } catch (err) {
       this.state.plugCommsOk = false;
       // A lost acknowledgement can mean the relay changed despite failure.
@@ -214,6 +259,7 @@ export class ControlLoop {
         { err: message, action: decision.action },
         'control loop: plug command failed — will retry next cycle',
       );
+      return 'failed';
     }
   }
 }

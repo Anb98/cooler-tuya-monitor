@@ -317,6 +317,40 @@ network. To restrict the API to the local machine, set `HTTP_HOST=127.0.0.1`.
 If you need access from an untrusted network, place it behind a reverse proxy
 that adds authentication.
 
+## Cycle telemetry
+
+Every completed control cycle writes one `info` log line with
+`event: "cooler.cycle"` and `schema: 1`, including cycles that hold the
+current state and fail-safe cycles. Existing log lines are unchanged.
+
+| Field | Meaning |
+|---|---|
+| `sampledAt` | Epoch ms when the sensor batch completed; `null` when the batch failed unexpectedly. |
+| `readbackAt` | Epoch ms when the pre-command relay read completed (successful or not). |
+| `completedAt` | Epoch ms when the cycle finished, including any command. |
+| `maxCpu`, `maxHdd` | Temperatures used by the decision; `null` when unavailable. An unexpected sensor failure reports `null`, never the previous cycle's values. |
+| `sensorOk` | `false` when any sensor failed this cycle. |
+| `thresholds` | `{ cpuHigh, hddHigh, cpuCritical, hddCritical }` in effect. |
+| `override` | Manual override used by the decision: `null`, `"on"` or `"off"`. A change made while a command is pending applies to the next cycle. |
+| `desiredFanOn` | Fan state the controller requested. |
+| `relayObservedFanOn` | Relay state read **before** any command this cycle: `true`, `false` or `null` (unknown or read failed). It is never a command acknowledgement. |
+| `commandOutcome` | `not_needed` (no command sent), `acknowledged` (the plug accepted the command) or `failed`. |
+| `plugCommsOk` | Communication health after the command phase. |
+| `dryRun` | `true` when `DRY_RUN` is enabled. |
+
+Limits:
+
+- A relay state cannot prove that the fan physically spins.
+- `acknowledged` means the plug accepted the command; the relay state is only
+  observed again at the next cycle's readback.
+- With `DRY_RUN=true`, readbacks and acknowledgements are simulated.
+- Timestamps come from the host clock. Skipped overlapping ticks and cycles that
+  end in an unhandled error produce no event, and `LOG_LEVEL` above `info`
+  suppresses it.
+- The event contains no error messages; read the existing `warn`/`error`
+  lines for failure details. If writing the event fails, the event is dropped
+  and control continues unchanged.
+
 ## Safety notes
 
 - Manual overrides are **never** allowed to disable thermal protection:
